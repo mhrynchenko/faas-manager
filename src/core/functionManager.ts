@@ -10,7 +10,6 @@ interface FunctionInstance {
 }
 
 interface RegisteredFunctionConfig {
-  path: string;
   name: string;
   handler: string;
 }
