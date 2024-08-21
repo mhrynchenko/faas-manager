@@ -1,40 +1,27 @@
 import { fork, ChildProcess } from 'node:child_process';
 import { resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
-import Bull from 'bull';
 import * as yaml from 'js-yaml';
 
 interface FunctionInstance {
   process: ChildProcess;
-  startTime: number;
+  busy: boolean;
 }
 
 interface RegisteredFunctionConfig {
   name: string;
   handler: string;
+  file: string;
 }
 
 export class FunctionManager {
   private activeInstances: number = 0;
   private totalInvocations: number = 0;
-  private processes: FunctionInstance[] = [];
-  private readonly sharedFile = resolve(__dirname, 'shared_file.txt');
-  private readonly messageQueue = new Bull('messageQueue');
-
-  constructor() {
-    setInterval(() => {
-      this.cleanup();
-    }, 60000);
-
-    this.messageQueue.process(async (job) => {
-      const { functionName, message } = job.data;
-      await this.processMessage(functionName, message);
-    });
-  }
+  private processesPool: FunctionInstance[] = [];
 
   public async handleMessage(functionName: string, message: string): Promise<void> {
     console.log(`Received message for function ${functionName}: ${message}`);
-    await this.messageQueue.add({ functionName, message });
+    await this.processMessage(functionName, message);
   }
 
   private async processMessage(functionName: string, message: string): Promise<void> {
@@ -44,7 +31,7 @@ export class FunctionManager {
       return;
     }
 
-    const idleProcess = this.processes.find(p => p.process.exitCode !== null);
+    const idleProcess = this.processesPool.find(p => !p.busy);
     if (idleProcess) {
       this.reuseProcess(idleProcess, functionConfig, message);
     } else {
@@ -68,31 +55,53 @@ export class FunctionManager {
   }
 
   private reuseProcess(instance: FunctionInstance, config: RegisteredFunctionConfig, message: string): void {
-    instance.process.send({ message, sharedFile: this.sharedFile, ...config });
-    instance.startTime = Date.now();
-    this.activeInstances++;
+    instance.busy = true;
+    instance.process.send({
+      event: { message },
+      functionName: config.name,
+      handlerName: config.handler,
+    });
   }
 
   private createProcess(config: RegisteredFunctionConfig, message: string): void {
     const child = fork(resolve(__dirname, 'functionProcess'));
 
-    child.send({ message, functionName: config.name, handlerName: config.handler, sharedFile: this.sharedFile });
-    
-    this.processes.push({ process: child, startTime: Date.now() });
+    const instance: FunctionInstance = {
+      process: child,
+      busy: true
+    };
+
+    child.send({
+      event: { message },
+      functionName: config.name,
+      handlerName: config.handler,
+      fileName: config.file,
+    });
+
+    child.on('message', this.onProcessMessage.bind(this));
+
+    this.processesPool.push(instance);
     this.activeInstances++;
   }
 
-  private cleanup(): void {
-    const now = Date.now();
-    this.processes = this.processes.filter(instance => {
-      if (instance.process.exitCode === null && (now - instance.startTime) > 60000) {
-        console.log(`Cleaning up process started at ${new Date(instance.startTime)}`);
-        instance.process.kill();
-        this.activeInstances--;
-        return false;
-      }
-      return true;
-    });
+  private onProcessMessage({ pid, status }: { pid: number, status: string }): void {
+    if (status === 'exit') {
+      this.processCleanup(pid);
+    } else if (status === 'idle') {
+      this.setProcessIdle(pid);
+    }
+  }
+
+  private setProcessIdle(pid: number): void {
+    const instance = this.processesPool.find(p => p.process.pid === pid);
+    if (instance) {
+      instance.busy = false;
+    }
+  }
+
+  private processCleanup(pid: number) {
+    this.processesPool = this.processesPool.filter(instance => instance.process.pid !== pid);
+    this.activeInstances--;
   }
 
   public getStatistics(): { activeInstances: number, totalInvocations: number } {
